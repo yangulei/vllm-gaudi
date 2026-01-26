@@ -373,6 +373,121 @@ def _fsdpa_prompt_attention(query: torch.Tensor,
     return attn_weights
 
 
+def _fa3_prompt_attention(query: torch.Tensor,
+                          key: torch.Tensor,
+                          value: torch.Tensor,
+                          scale: float,
+                          is_causal: bool,
+                          attn_bias: Optional[torch.Tensor] = None,
+                          valid_seq_lengths: Optional[torch.Tensor] = None,
+                          window_size: Optional[int] = None,
+                          **ignored_args) -> torch.Tensor:
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+    padding_side = 'right'
+    if get_config().fp32_softmax:
+        softmax_mode = 'fp32'
+    else:
+        softmax_mode = 'fast'
+    recompute_mode = True
+    assert attn_bias is not None or valid_seq_lengths is not None, \
+        'Either attn_bias or valid_seq_lengths must be != None'
+
+    args = [
+        query, key, value, attn_bias, 0.0, is_causal, scale, softmax_mode, recompute_mode, valid_seq_lengths,
+        padding_side
+    ]
+    args += [window_size] if window_size else []
+    from habana_frameworks.torch.hpex.kernels.FusedSDPA import is_gqa, gqa_input_reshape_fwd, gqa_output_reshape
+    gqa = is_gqa(query, key)
+    if gqa:
+        q, k, v, attn_mask = gqa_input_reshape_fwd(query, key, value, attn_bias)
+    else:
+        q, k, v, attn_mask = query, key, value, attn_bias
+    q_len = q.shape[-2]
+    kv_len = k.shape[-2]
+    chunk_size = 4096  # TODO: make it configurable
+    with_mark_step = True  # TODO: make it configurable
+
+    chunk_outputs = []
+    num_q_chunks = (q_len + chunk_size - 1) // chunk_size
+    num_kv_chunks = (kv_len + chunk_size - 1) // chunk_size
+    for q_chunk_idx in range(num_q_chunks):
+        q_start = q_len - (q_chunk_idx + 1) * chunk_size
+        q_start = max(q_start, 0)
+        q_end = q_len - q_chunk_idx * chunk_size
+        q_chunk_size = q_end - q_start
+        q_chunk = q[..., q_start:q_end, :]
+
+        last_out = None
+        last_m = None
+        last_linv = None
+        for kv_chunk_idx in range(num_kv_chunks - q_chunk_idx):
+            kv_start = kv_len - (kv_chunk_idx + 1) * chunk_size
+            kv_start = max(kv_start, 0)
+            kv_end = kv_len - kv_chunk_idx * chunk_size
+            kv_chunk_size = kv_end - kv_start
+            k_chunk = k[..., kv_start:kv_end, :]
+            v_chunk = v[..., kv_start:kv_end, :]
+
+            is_causal_chunk = kv_chunk_idx == 0 and q_chunk_idx != 0
+            is_causal_chunk = is_causal_chunk and chunk_size % 1024 == 0
+
+            if kv_chunk_idx == 0 and not is_causal_chunk:
+                if attn_mask is not None:
+                    mask_chunk = attn_mask[..., q_start:q_end, kv_start:kv_end]
+                else:
+                    mask_shape = (q_chunk.shape[0], 1, 1, q_chunk_size,
+                                  kv_chunk_size) if gqa else (q_chunk.shape[0], 1, q_chunk_size, kv_chunk_size)
+                    # use -3e38 intead of -inf to avoid nan
+                    mask_chunk = (1.0 -
+                                  torch.tril(torch.ones(mask_shape, dtype=q.dtype, device=q_chunk.device))) * -3e38
+            else:
+                mask_chunk = None
+
+            if with_mark_step:
+                q_chunk = q_chunk.clone()
+                k_chunk = k_chunk.clone()
+                v_chunk = v_chunk.clone()
+                if mask_chunk is not None:
+                    mask_chunk = mask_chunk.clone()
+                htorch.core.mark_step()
+            chunk_res = torch.ops.hpu.sdpa_recomp_fwd(
+                q_chunk,
+                k_chunk,
+                v_chunk,
+                mask_chunk,
+                0.0,  # dropout_p,
+                scale,
+                is_causal_chunk,
+                True,  # requires_backward
+                'fp32' if get_config().fp32_softmax else 'fast',  # softmax_mode
+                None,  # valid_seq_len
+                'left'  # padding_side,
+            )
+            chunk_out, chunk_m, chunk_linv = ((gqa_output_reshape(x) if gqa else x).to(torch.float32)
+                                              for x in (chunk_res[:3]))
+            if last_out is None or last_m is None or last_linv is None:
+                last_out = chunk_out
+                last_m = chunk_m
+                last_linv = chunk_linv
+            else:
+                new_m = torch.maximum(last_m, chunk_m)
+                last_linv_rescaled = (1.0 / last_linv) * torch.exp(last_m - new_m)
+                chunk_linv_rescaled = (1.0 / chunk_linv) * torch.exp(chunk_m - new_m)
+                last_linv = 1.0 / (last_linv_rescaled + chunk_linv_rescaled)
+                last_out = (last_linv_rescaled * last_linv) * last_out + (chunk_linv_rescaled * last_linv) * chunk_out
+                last_m = new_m
+            if with_mark_step:
+                htorch.core.mark_step()
+        chunk_outputs.append(last_out)
+    chunk_outputs = list(reversed(chunk_outputs))
+    output = torch.cat(chunk_outputs, dim=-2)
+    attn_weights = output.transpose(1, 2)
+    return attn_weights
+
+
 def prompt_attention(
     impl: str,
     **args,
@@ -382,6 +497,7 @@ def prompt_attention(
         'naive_impl': _naive_prompt_attention,
         'fsdpa_impl': _fsdpa_prompt_attention,
         'flex_impl': _flex_prompt_attention,
+        'fa3_impl': _fa3_prompt_attention,
     }
     assert impl in impl_mapping, f'Unsupported implementation: {impl}'
     return impl_mapping[impl](**args)
