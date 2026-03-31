@@ -872,6 +872,17 @@ class HPUCompressedTensorsKVCacheMethod(CompressedTensorsKVCacheMethod):
         layer.impl.fused_scaled_dot_product_attention.d_scale_k = 1 / k_scale.detach()
         layer.impl.fused_scaled_dot_product_attention.d_scale_v = 1 / v_scale.detach()
 
+        if get_config().enable_unit_moe:
+            layer.impl.matmul_qk.scale_input = 1.0
+            layer.impl.matmul_qk.scale_other = 1.0
+            layer.impl.matmul_av.scale_other = 1.0
+            layer.impl.fused_scaled_dot_product_attention.scale_q = 1.0
+            layer.impl.fused_scaled_dot_product_attention.scale_k = 1.0
+            layer.impl.fused_scaled_dot_product_attention.scale_v = 1.0
+            layer.impl.fused_scaled_dot_product_attention.d_scale_q = 1.0
+            layer.impl.fused_scaled_dot_product_attention.d_scale_k = 1.0
+            layer.impl.fused_scaled_dot_product_attention.d_scale_v = 1.0
+
         # Note: The following steps are important to avoid compiling each decoding layer into a different gc recipe
         # Step 1: Remove deprecated scale attributes
         self._remove_attrs(layer, attrs_lst=self.OLD_SCALE_ATTRS)
